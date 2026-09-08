@@ -23,7 +23,7 @@ static float venturiArea2 = 0.0;
 
 // ---- Air density state ----
 static float inverseRhoCoeff = sqrt(2.0 / 1.123);  // Default: 35°C, 95% humidity
-static float VATPStoSTDP = 1.0;
+static float atpsToStpdFactor = 1.0;
 
 // Water vapor pressure table (hPa) for temperatures 20°C to 40°C
 // Used for BTPS calculation and ATPS→STPD conversion
@@ -67,15 +67,18 @@ void calcAirDensity(float ambientPressure, float exhaleTemp) {
 
     // ATPS to STPD conversion factor
     // V_STPD = V_ATPS * (273.15/T_K) * ((P_amb - P_water) / 1013.25)
-    VATPStoSTDP = 273.15f / temperature_kelvin;
-    VATPStoSTDP *= (ambientPressure - moistVaporPressure[tempIdx]) / 1013.25f;
+    float vaporPressure = moistVaporPressure[tempIdx];
+    atpsToStpdFactor = 273.15f / temperature_kelvin;
+    atpsToStpdFactor *= (ambientPressure - vaporPressure) / 1013.25f;
 
     // Air density at exhale conditions (BTPS: body temp, ambient pressure, saturated)
     // rho = (P_dry * M_dry + P_vapor * M_water) / (R * T)
+    // P_dry = P_ambient - P_vapor (Dalton's law)
     // M_dry = 28.9652 g/mol → 2.89652 (scaled for hPa)
     // M_water = 18.016 g/mol → 1.8016 (scaled for hPa)
     // R = 8.31446 J/(mol·K)
-    float rho = (ambientPressure * 2.89652f + moistVaporPressure[tempIdx] * 1.8016f)
+    float dryPressure = ambientPressure - vaporPressure;
+    float rho = (dryPressure * 2.89652f + vaporPressure * 1.8016f)
                 / (8.31446f * temperature_kelvin);
 
     // Sanity check
@@ -90,39 +93,44 @@ float getInverseRhoCoeff(void) {
 }
 
 float getATPStoSTDP(void) {
-    return VATPStoSTDP;
+    return atpsToStpdFactor;
 }
 
 // ---- VO2 Calculation ----
 
-float calcVO2(float veMean, float initialO2, float currentO2) {
-    // VO2 = VE * (FiO2 - FeO2)
-    // Without CO2 sensor, assume inspired N2 ≈ expired N2 (Haldane transformation simplified)
+float calcApproxVO2(float veMean, float initialO2, float currentO2) {
+    // Approximate VO2 without CO2 sensor.
+    // Assumes Vi ≈ Ve (inspired volume ≈ expired volume).
+    // This is NOT the Haldane transformation. Accuracy degrades when RQ ≠ 1.0
+    // (error up to ~5-8% at high exercise intensity).
+    // VO2_approx = VE * (FiO2 - FeO2)
     float depletedO2 = (initialO2 - currentO2) * 0.01f;  // Convert % to fraction
     if (depletedO2 < 0.0f) depletedO2 = 0.0f;
-    return veMean * depletedO2;  // L/min
+    return veMean * depletedO2;  // L/min (approximate)
 }
 
 float calcVO2withCO2(float veMean, float initialO2, float currentO2,
                      float initialCO2, float currentCO2, float *vco2Out) {
-    // With CO2 sensor: use Haldane transformation
-    // Expired N2 fraction
+    // With CO2 sensor: use true Haldane transformation.
+    // N2 is inert → Vi*FiN2 = Ve*FeN2 → Vi = Ve * FeN2/FiN2
     float feO2 = currentO2 * 0.01f;
     float feCO2 = currentCO2 * 0.01f;
     float feN2 = 1.0f - feO2 - feCO2;
 
-    // VO2 = VE * (FeN2 * FiO2/FiN2 - FeO2)
-    // FiO2 ≈ initialO2/100, FiN2 ≈ 0.7903 (≈ 1 - 0.2093 - 0.0004)
     float fiO2 = initialO2 * 0.01f;
-    float fiN2 = 1.0f - fiO2 - initialCO2 * 0.01f;
+    float fiCO2 = initialCO2 * 0.01f;
+    float fiN2 = 1.0f - fiO2 - fiCO2;
 
-    float vo2 = veMean * (feN2 * fiO2 / fiN2 - feO2);
+    // Inspired volume from Haldane N2 balance
+    float viMean = veMean * feN2 / fiN2;
+
+    // VO2 = Vi*FiO2 - Ve*FeO2
+    float vo2 = viMean * fiO2 - veMean * feO2;
     if (vo2 < 0.0f) vo2 = 0.0f;
 
-    // VCO2 = VE * (FeCO2 - FiCO2)
+    // VCO2 = Ve*FeCO2 - Vi*FiCO2
     if (vco2Out) {
-        float fiCO2 = initialCO2 * 0.01f;
-        *vco2Out = veMean * (feCO2 - fiCO2);
+        *vco2Out = veMean * feCO2 - viMean * fiCO2;
         if (*vco2Out < 0.0f) *vco2Out = 0.0f;
     }
 

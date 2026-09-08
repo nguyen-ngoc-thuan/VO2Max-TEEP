@@ -154,9 +154,9 @@ void setup() {
     init_filesystem();
 
     // ---- Create FreeRTOS Tasks ----
-    xTaskCreatePinnedToCore(sensorTask, "sensor", 8192, nullptr, 50, &sensorTaskHandle, 1);
-    xTaskCreatePinnedToCore(wifiTask, "wifi", 8192, nullptr, 20, &wifiTaskHandle, 0);
-    xTaskCreatePinnedToCore(BLETask, "ble", 8192, nullptr, 15, &bleTaskHandle, 0);
+    xTaskCreatePinnedToCore(sensorTask, "sensor", 8192, nullptr, 8, &sensorTaskHandle, 1);
+    xTaskCreatePinnedToCore(wifiTask, "wifi", 8192, nullptr, 4, &wifiTaskHandle, 0);
+    xTaskCreatePinnedToCore(BLETask, "ble", 8192, nullptr, 3, &bleTaskHandle, 0);
 
     // Wait for sensor init
     tft.drawString("Sensors...", 120, 100, 4);

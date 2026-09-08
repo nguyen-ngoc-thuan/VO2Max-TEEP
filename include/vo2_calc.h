@@ -30,10 +30,11 @@ float getATPStoSTDP(void);
 
 // ---- VO2 Calculation ----
 
-// Calculate VO2 from VE and O2 readings (no CO2 sensor)
+// Calculate approximate VO2 from VE and O2 readings (no CO2 sensor)
+// Assumes Vi ≈ Ve. NOT the Haldane transformation.
 // veMean in L/min, initialO2 and currentO2 in %
-// Returns VO2 in L/min
-float calcVO2(float veMean, float initialO2, float currentO2);
+// Returns approximate VO2 in L/min
+float calcApproxVO2(float veMean, float initialO2, float currentO2);
 
 // Calculate VO2 and VCO2 with CO2 sensor data
 // Returns VO2 in L/min, vco2Out receives VCO2 in L/min

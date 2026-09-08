@@ -60,15 +60,19 @@ static sensorExtraData_t extraDataBuf;
 // ---- Flow integration state ----
 static float prevPressure[3] = {0};
 static float currentPressure = 0.0f;
-static const float pressureThreshold = 0.2f;  // Pa, start/stop exhale detection
+static const float startThresholdPa = 0.25f;  // Hysteresis: start exhale detection
+static const float stopThresholdPa = 0.12f;   // Hysteresis: end exhale detection
+static float pressureZeroPa = 0.0f;           // Zero offset from calibration
 static float integratedPressure = 0.0f;
 static float integrationTotal = 0.0f;
 static uint32_t integrationTime = 0;
 static unsigned int storeIntervalTime = 0;
 static bool integratePressure = false;
 static bool newBreathData = false;
+static bool hasPreviousBreath = false;    // Skip first breath interval
 static uint32_t breathIntervalCount = 0;
 static uint32_t lastBreathInterval = 0;
+static uint32_t previousFlowTimeUs = 0;   // For real dt integration
 
 // ---- Venturi & correction ----
 static float flowCorrectionFactor = 1.0f;
@@ -100,6 +104,15 @@ static float caloriesPerMin = 0.0f;
 static float caloriesTotal = 0.0f;
 static uint32_t lastCalTime = 0;
 
+// ---- Time-based O2 averaging ----
+static float o2Sum = 0.0f;
+static uint32_t o2SampleCount = 0;
+static bool fiO2Locked = false;           // Lock FiO2 after warm-up
+
+// ---- Ring buffer state ----
+static bool bufferWrapped = false;
+static uint32_t totalStoredSamples = 0;
+
 // ---- Low-pass filter ----
 static const float lpGain = 0.02f;  // ~3s time constant at 50ms intervals
 
@@ -110,8 +123,13 @@ static void readFlow(void) {
     prevPressure[1] = prevPressure[2];
     prevPressure[2] = currentPressure;
 
-    integrationTime += FLOWINTERVAL;
-    breathIntervalCount += FLOWINTERVAL;
+    // Calculate real dt instead of assuming fixed FLOWINTERVAL
+    uint32_t nowUs = micros();
+    float dtMs = (previousFlowTimeUs > 0) ? (float)(nowUs - previousFlowTimeUs) / 1000.0f : (float)FLOWINTERVAL;
+    previousFlowTimeUs = nowUs;
+
+    integrationTime += (uint32_t)dtMs;
+    breathIntervalCount += (uint32_t)dtMs;
 
     float rawPressure = flowSensor.getPressure();
     if (isnan(rawPressure)) {
@@ -119,34 +137,48 @@ static void readFlow(void) {
         return;
     }
 
-    currentPressure = rawPressure;
+    // Apply zero offset calibration
+    currentPressure = rawPressure - pressureZeroPa;
     if (currentPressure < 0.0f) currentPressure = 0.0f;
 
     if (integratePressure) {
-        // Currently exhaling — integrate sqrt(P)
-        integratedPressure += sqrt(currentPressure);
-        integrationTotal += sqrt(currentPressure);
+        // Currently exhaling — integrate sqrt(P) weighted by real dt
+        float sqrtP = sqrt(currentPressure);
+        integratedPressure += sqrtP * (dtMs / (float)FLOWINTERVAL);  // Normalize to equivalent samples
+        integrationTotal += sqrtP * (dtMs / (float)FLOWINTERVAL);
 
-        // Detect end of exhale: 3 consecutive samples below threshold
-        if (currentPressure <= pressureThreshold &&
-            prevPressure[2] <= pressureThreshold &&
-            prevPressure[1] <= pressureThreshold) {
+        // Detect end of exhale: 3 consecutive samples below stop threshold (hysteresis)
+        if (currentPressure <= stopThresholdPa &&
+            prevPressure[2] <= stopThresholdPa &&
+            prevPressure[1] <= stopThresholdPa) {
             newBreathData = true;
             integratePressure = false;
         }
-    } else if (currentPressure >= pressureThreshold &&
-               prevPressure[2] >= pressureThreshold &&
-               prevPressure[1] >= pressureThreshold) {
-        // Start of new exhale detected
+    } else if (currentPressure >= startThresholdPa &&
+               prevPressure[2] >= startThresholdPa &&
+               prevPressure[1] >= startThresholdPa) {
+        // Start of new exhale detected (hysteresis: higher threshold to start)
         integratedPressure = sqrt(currentPressure) + sqrt(prevPressure[2]) +
                              sqrt(prevPressure[1]) + sqrt(prevPressure[0]);
         integrationTotal += integratedPressure;
 
-        lastBreathInterval = breathIntervalCount;
+        // Only use breath interval from second breath onwards
+        if (hasPreviousBreath) {
+            lastBreathInterval = breathIntervalCount;
+        }
+        hasPreviousBreath = true;
         breathIntervalCount = 0;
         integratePressure = true;
         newBreathData = false;
     }
+
+    // $FAST: High-rate flow waveform for breath visualization (every flow read ~10Hz)
+    Serial.printf("$FAST,%.3f,%.3f,%.2f,%d\r\n",
+        (float)millis() / 1000.0f,   // Time (s)
+        currentPressure,              // ΔP zeroed (Pa)
+        currentO2,                    // FeO2 (%)
+        integratePressure ? 1 : 0     // Exhale state (1=exhaling)
+    );
 
     xEventGroupSetBits(sensorEvent, SENSOR_EVENT_FLOW);
 }
@@ -172,8 +204,14 @@ static void readO2(void) {
     } else if (o2_read_step == 1) {
         float val;
         if (oxygenSensor.readOxygenValue(val)) {
-            currentO2 = val;
-            if (currentO2 > initialO2) initialO2 = currentO2;  // Drift compensation
+            // Sanity check: O2 in air should be 10-25%
+            if (val >= 10.0f && val <= 25.0f) {
+                currentO2 = val;
+                // Accumulate for time-based averaging
+                o2Sum += val;
+                o2SampleCount++;
+            }
+            // FiO2 is locked after warm-up. Do NOT auto-update.
         }
     }
     if (o2_read_step > 0) o2_read_step--;
@@ -216,16 +254,15 @@ static void calculateVolumes(void) {
         veMean *= (float)NORMALIZATION_TIME / (float)integrationTime;
         veMean *= stpd;
 
-        if (averagingCount > 0) {
-            float avgO2 = averageO2 / (float)averagingCount;
-            float avgCO2 = averageCO2 / (float)averagingCount;
+        // Use time-based O2 average instead of per-breath average
+        if (o2SampleCount > 0) {
+            float avgO2 = o2Sum / (float)o2SampleCount;
 
-            vo2 = calcVO2(veMean, initialO2, avgO2);
+            vo2 = calcApproxVO2(veMean, initialO2, avgO2);
             if (vo2 > vo2Max) vo2Max = vo2;
 
-            // Calories
-            float vo2Total = vo2 * weight / 1000.0f;  // Back to L/min total
-            caloriesPerMin = calcCaloriesPerMin(vo2Total);
+            // Calories: vo2 is already in L/min absolute
+            caloriesPerMin = calcCaloriesPerMin(vo2);
             uint32_t now = millis();
             if (lastCalTime > 0) {
                 caloriesTotal += caloriesPerMin * (float)(now - lastCalTime) / 60000.0f;
@@ -250,7 +287,11 @@ static void calculateVolumes(void) {
             bufferData[bufferPosition].o2 = currentO2;
 
             bufferPosition++;
-            if (bufferPosition >= STORE_BUFFER_SIZE) bufferPosition = 0;
+            totalStoredSamples++;
+            if (bufferPosition >= STORE_BUFFER_SIZE) {
+                bufferPosition = 0;
+                bufferWrapped = true;
+            }
             storeIntervalTime = 0;
         }
 
@@ -260,6 +301,27 @@ static void calculateVolumes(void) {
         averagingCount = 0;
         averageO2 = 0.0f;
         averageCO2 = 0.0f;
+        o2Sum = 0.0f;
+        o2SampleCount = 0;
+
+        // ---- Serial diagnostic output (every integration period) ----
+        float vo2rel = (weight > 0) ? (1000.0f * vo2 / weight) : 0.0f;
+        float respRate = (lastBreathInterval > 0) ? (60000.0f / (float)lastBreathInterval) : 0.0f;
+        Serial.printf("$DIAG,%.1f,%.3f,%.2f,%.2f,%.1f,%.1f,%.2f,%.4f,%.1f,%.2f,%.1f,%.3f,%d\r\n",
+            (float)millis() / 1000.0f,  // Time (s)
+            currentPressure,             // ΔP instant (Pa)
+            currentO2,                   // FeO2 (%)
+            initialO2,                   // FiO2 (%)
+            ambient_pressure,            // P_amb (hPa)
+            ambient_temperature,         // T_amb (°C)
+            veMean,                      // VE (L/min)
+            vo2,                         // VO2 absolute (L/min)
+            vo2rel,                      // VO2 relative (ml/min/kg)
+            caloriesPerMin,              // Cal (kcal/min)
+            respRate,                    // Resp rate (b/min)
+            pressureZeroPa,              // D6F zero offset (Pa)
+            errorCounter                 // Error count
+        );
 
         xEventGroupSetBits(sensorEvent, SENSOR_EVENT_AVE);
     }
@@ -297,8 +359,10 @@ static void resetCalculations(void) {
     integrationTime = 0;
     integratePressure = false;
     newBreathData = false;
+    hasPreviousBreath = false;
     breathIntervalCount = 0;
     lastBreathInterval = 0;
+    previousFlowTimeUs = 0;
     lastBreathVolume = 0.0f;
     veMax = 0.0f;
     veMean = 0.0f;
@@ -306,10 +370,14 @@ static void resetCalculations(void) {
     vco2 = 0.0f; vco2Max = 0.0f;
     averageO2 = 0.0f; averageCO2 = 0.0f;
     averagingCount = 0;
+    o2Sum = 0.0f;
+    o2SampleCount = 0;
     caloriesPerMin = 0.0f;
     caloriesTotal = 0.0f;
     lastCalTime = 0;
     bufferPosition = 0;
+    bufferWrapped = false;
+    totalStoredSamples = 0;
     memset(bufferData, 0, sizeof(bufferData));
 }
 
@@ -368,9 +436,71 @@ void sensorTask(void *params) {
 
     resetCalculations();
 
+    // ---- Zero calibration for D6F flow sensor ----
+    if (xEventGroupGetBits(sensorStatus) & SENSOR_HAS_FLOW) {
+        ESP_LOGI(TAG, "Flow sensor zero calibration (100 samples)...");
+        float zeroSum = 0.0f;
+        int zeroCount = 0;
+        for (int i = 0; i < 100; i++) {
+            float p = flowSensor.getPressure();
+            if (!isnan(p)) {
+                zeroSum += p;
+                zeroCount++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(40));
+        }
+        if (zeroCount > 0) {
+            pressureZeroPa = zeroSum / (float)zeroCount;
+            ESP_LOGI(TAG, "Flow zero offset: %.3f Pa (%d samples)", pressureZeroPa, zeroCount);
+        }
+    }
+
+    // ---- O2 warm-up baseline (60s) to calculate accurate FiO2 ----
+    if (xEventGroupGetBits(sensorStatus) & SENSOR_HAS_O2) {
+        ESP_LOGI(TAG, "O2 sensor warm-up baseline (60s)...");
+        float fiO2Sum = 0.0f;
+        int fiO2Count = 0;
+        for (int i = 0; i < 120; i++) {  // 120 × 500ms = 60s
+            oxygenSensor.triggerSampling();
+            vTaskDelay(pdMS_TO_TICKS(150));
+            float val;
+            if (oxygenSensor.readOxygenValue(val)) {
+                if (val >= 18.0f && val <= 23.0f) {
+                    fiO2Sum += val;
+                    fiO2Count++;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(350));
+            // Print progress every 10s
+            if (i % 20 == 0) {
+                ESP_LOGI(TAG, "O2 warm-up: %ds, samples=%d, avg=%.2f%%",
+                    (i * 500) / 1000, fiO2Count,
+                    fiO2Count > 0 ? fiO2Sum / fiO2Count : 0.0f);
+            }
+        }
+        if (fiO2Count >= 10) {
+            initialO2 = fiO2Sum / (float)fiO2Count;
+            ESP_LOGI(TAG, "FiO2 locked at %.2f%% (%d samples)", initialO2, fiO2Count);
+        } else {
+            ESP_LOGW(TAG, "O2 warm-up insufficient samples (%d), using default FiO2=%.2f%%", fiO2Count, initialO2);
+        }
+    }
+    fiO2Locked = true;
+
+    // ---- Initialize BMP280 from first real reading ----
+    if (xEventGroupGetBits(sensorStatus) & SENSOR_HAS_PRESSURE) {
+        float t = bmp.readTemperature();
+        float p = bmp.readPressure() / 100.0f;
+        if (!isnan(t) && !isnan(p) && p > 800.0f && p < 1200.0f) {
+            ambient_temperature = t;
+            ambient_pressure = p;
+            ESP_LOGI(TAG, "BMP280 initial: T=%.1f°C, P=%.1f hPa", t, p);
+        }
+    }
+
     xEventGroupSetBits(sensorStatus, SENSOR_INIT_DONE);
 
-    // ---- Main loop ----
+
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(READINTERVAL);
     uint8_t step = 0;
@@ -472,7 +602,10 @@ bool sensorAddExtraValue(uint8_t type, float value, TickType_t timeout) {
     return xQueueSendToBack(sensorExtraQueue, (void *)&data, timeout) == pdTRUE;
 }
 
-uint16_t sensorGetStatus() { return xEventGroupGetBits(sensorStatus); }
+uint16_t sensorGetStatus() {
+    if (!sensorStatus) return 0;  // Safe: may be called before task creates event group
+    return xEventGroupGetBits(sensorStatus);
+}
 void sensorSetInitial(void) { xEventGroupSetBits(sensorEvent, SENSOR_EVENT_INIT); }
 void sensorResetCalculation(void) { xEventGroupSetBits(sensorEvent, SENSOR_EVENT_RESET); }
 void sensorO2Calibrate(void) { xEventGroupSetBits(sensorEvent, SENSOR_EVENT_O2_CAL); }
